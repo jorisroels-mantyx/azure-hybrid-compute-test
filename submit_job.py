@@ -13,6 +13,7 @@ Optional env vars:
 
 import datetime
 import os
+import pathlib
 import sys
 import time
 
@@ -22,10 +23,9 @@ from azure.mgmt.hybridcompute.models import MachineRunCommand, MachineRunCommand
 
 SUBSCRIPTION_ID = os.environ["AZURE_SUBSCRIPTION_ID"]
 RESOURCE_GROUP = os.environ.get("ARC_RESOURCE_GROUP", "hybrid-arc-rg")
-SCRIPT = os.environ.get(
-    "ARC_SCRIPT",
-    'echo "Processing on $(hostname) at $(date)"; sleep 3; echo "Done"',
-)
+
+_default_script = pathlib.Path(__file__).parent / "train_iris.sh"
+SCRIPT = os.environ.get("ARC_SCRIPT") or _default_script.read_text()
 
 
 def get_client() -> HybridComputeManagementClient:
@@ -95,6 +95,7 @@ def main() -> None:
     for machine_name, cmd_name in cmd_names.items():
         print(f"Submitting Run Command to {machine_name}...")
         submit_run_command(client, machine_name, cmd_name)
+        print(f"Run Command submitted to {machine_name}")
 
     exit_codes: dict[str, int] = {}
     for machine_name, cmd_name in cmd_names.items():

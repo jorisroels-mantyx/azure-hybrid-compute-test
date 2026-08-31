@@ -131,11 +131,22 @@ resource batchAccount 'Microsoft.Batch/batchAccounts@2024-02-01' = {
   }
 }
 
+// ── Azure Container Registry ──────────────────────────────
+resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
+  name: 'hybridarccr001'
+  location: location
+  sku: { name: 'Basic' }
+  properties: {
+    adminUserEnabled: true
+  }
+}
+
 // ── Outputs ───────────────────────────────────────────────
 output vpnGatewayPublicIp string = vpnPip.properties.ipAddress
 output batchAccountEndpoint string = batchAccount.properties.accountEndpoint
 output batchAccountName string = batchAccount.name
 output storageAccountName string = storageAccount.name
+output acrLoginServer string = acr.properties.loginServer
 
 @secure()
 output storageAccountKey string = storageAccount.listKeys().keys[0].value

@@ -33,3 +33,4 @@ output batchAccountEndpoint string = resources.outputs.batchAccountEndpoint
 output batchAccountName string = resources.outputs.batchAccountName
 output storageAccountName string = resources.outputs.storageAccountName
 output storageAccountKey string = resources.outputs.storageAccountKey
+output acrLoginServer string = resources.outputs.acrLoginServer

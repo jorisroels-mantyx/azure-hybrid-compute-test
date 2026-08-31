@@ -1,0 +1,13 @@
+job:
+  id: iris-train-001
+  display_name: "Iris classifier training"
+
+  pool:
+    resource_group: hybrid-arc-rg
+    node_filter: [gpu1]
+
+  tasks:
+    - id: task-001
+      display_name: "Train iris classifier"
+      image: hybridarccr001.azurecr.io/iris-trainer:latest
+      timeout_seconds: 300

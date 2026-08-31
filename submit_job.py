@@ -57,7 +57,7 @@ def submit_run_command(
         resource_group_name=RESOURCE_GROUP,
         machine_name=machine_name,
         run_command_name=cmd_name,
-        run_command_body=cmd,
+        run_command_properties=cmd,
     ).result()
 
 

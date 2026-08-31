@@ -1,29 +1,30 @@
-# Azure Hybrid Batch Compute
+# Azure Hybrid Arc Compute
 
-Run Azure Batch jobs across cloud VMs and on-premises servers connected via a Site-to-Site VPN.
+Run workloads on on-premises servers managed through Azure Arc — no VPN or router configuration required.
 
 ## Architecture
 
 ```
-Azure                                    On-prem (192.168.1.0/24)
+Azure                                    On-prem
 ┌──────────────────────┐                 ┌──────────────────────┐
-│  Batch Account       │   IPsec VPN     │  Server A            │
-│  ├─ hybrid-pool      │◄───────────────►│  └─ Batch node agent │
-│  │   ├─ cloud nodes  │                 │                      │
-│  │   └─ on-prem nodes│                 │  Server B            │
-│  Storage Account     │                 │  └─ Batch node agent │
-│  ├─ batch-input/     │                 └──────────────────────┘
-│  └─ batch-output/    │
+│  Azure Arc           │   outbound      │  Server A            │
+│  ├─ onprem-node-01   │◄── HTTPS ──────│  └─ azcmagent        │
+│  ├─ onprem-node-02   │    (port 443)   │                      │
+│  │                   │                 │  Server B            │
+│  Storage Account     │                 │  └─ azcmagent        │
+│  ├─ arc-input/       │                 └──────────────────────┘
+│  └─ arc-output/      │
+│  Log Analytics       │
 └──────────────────────┘
 ```
 
-Tasks are submitted to the pool; Azure Batch distributes them across all available nodes (cloud and on-prem) automatically.
+Each on-prem server runs the Azure Arc Connected Machine Agent (`azcmagent`), which opens an outbound HTTPS connection to Azure. No inbound ports, no firewall rules, no router changes needed. Workloads are dispatched from Azure to the nodes via **Arc Run Command**.
 
 ## Prerequisites
 
-- Azure CLI (`az`)
+- Azure CLI (`az`) authenticated to your subscription
 - [uv](https://github.com/astral-sh/uv) (Python package manager)
-- On-prem servers running Ubuntu 22.04 with VPN connectivity
+- On-prem servers running Ubuntu 22.04 with outbound internet access on port 443
 
 ## Usage
 
@@ -37,44 +38,60 @@ az deployment sub create \
 ```
 
 This creates:
-- VNet + VPN Gateway (for on-prem connectivity)
-- Azure Batch account
-- Storage account (input/output containers)
+- VNet (for future Azure-side resources)
+- Storage account (arc-input / arc-output containers)
+- Log Analytics workspace (Arc telemetry)
 
-### 2. Configure on-prem router
+### 2. Register on-prem nodes
 
-Point your IPsec tunnel at the `vpnGatewayPublicIp` output using the shared key from `main.bicepparam`.
-
-### 3. Register on-prem nodes
-
-On each on-prem server, run the setup script:
+Create a service principal with the `Azure Connected Machine Onboarding` role:
 
 ```bash
-export BATCH_ACCOUNT_NAME="hybridbatch001"
-export BATCH_ACCOUNT_URL="hybridbatch001.swedencentral.batch.azure.com"
-export BATCH_ACCOUNT_KEY="<from deployment output or portal>"
-export BATCH_POOL_ID="hybrid-pool"
+az ad sp create-for-rbac \
+  --name "arc-onboarding-sp" \
+  --role "Azure Connected Machine Onboarding" \
+  --scopes "/subscriptions/<subscription-id>/resourceGroups/hybrid-arc-rg"
+```
+
+Then on each on-prem server:
+
+```bash
+export ARC_SUBSCRIPTION_ID="<subscription-id>"
+export ARC_RESOURCE_GROUP="hybrid-arc-rg"
+export ARC_LOCATION="swedencentral"
+export ARC_TENANT_ID="<tenant-id>"
+export ARC_SERVICE_PRINCIPAL_ID="<appId>"
+export ARC_SERVICE_PRINCIPAL_SECRET="<password>"
+export ARC_MACHINE_NAME="onprem-node-01"   # unique per machine
 
 bash setup_node.sh
 ```
 
-### 4. Submit a test job
+Verify registration (from local machine, after ~2 minutes):
 
 ```bash
-export BATCH_ACCOUNT_NAME="hybridbatch001"
-export BATCH_ACCOUNT_URL="hybridbatch001.swedencentral.batch.azure.com"
-export BATCH_ACCOUNT_KEY="<key>"
+az connectedmachine list --resource-group hybrid-arc-rg -o table
+```
+
+### 3. Submit a job
+
+```bash
+export AZURE_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+export ARC_RESOURCE_GROUP="hybrid-arc-rg"
+export ARC_SCRIPT='echo "Hello from $(hostname)"'   # your workload here
 
 uv run submit_job.py
 ```
+
+The script discovers all Connected Arc machines in the resource group, runs the script on each, and reports the results.
 
 ## Project structure
 
 ```
 main.bicep          # Subscription-scoped entry point
-resources.bicep     # Azure resource definitions (VPN, Batch, Storage)
+resources.bicep     # Azure resource definitions (VNet, Storage, Log Analytics)
 main.bicepparam     # Deployment parameters
-submit_job.py       # Creates pool + submits sample tasks
-setup_node.sh       # Installs Batch node agent on on-prem servers
+submit_job.py       # Dispatches Arc Run Commands to registered nodes
+setup_node.sh       # Installs and connects the Arc agent on on-prem servers
 pyproject.toml      # Python dependencies
 ```

@@ -1,9 +1,9 @@
 [project]
-name = "azure-hybrid-batch"
-version = "0.1.0"
+name = "azure-hybrid-arc"
+version = "0.2.0"
 requires-python = ">=3.12"
 dependencies = [
-    "azure-batch>=15.0.0",
-    "azure-core>=1.30.0",
+    "azure-mgmt-hybridcompute>=9.0.0",
+    "azure-identity>=1.17.0",
     "azure-storage-blob>=12.20.0",
 ]

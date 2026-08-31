@@ -1,8 +1,14 @@
-"""Submit a test job to the Azure Batch hybrid pool.
+"""Submit workloads to Arc-enabled on-prem servers via Azure Arc Run Command.
 
-This script creates a pool (if it doesn't exist), submits a job with
-sample tasks, and waits for completion. On-prem nodes that have joined
-the pool will pick up tasks alongside any cloud nodes.
+For each Connected Arc machine in the resource group, issues a Run Command
+(a shell script executed locally by the Arc agent). Polls each command until
+completion and prints stdout/stderr.
+
+Required env vars:
+    AZURE_SUBSCRIPTION_ID
+Optional env vars:
+    ARC_RESOURCE_GROUP  (default: hybrid-arc-rg)
+    ARC_SCRIPT          (default: inline echo demo)
 """
 
 import datetime
@@ -10,96 +16,102 @@ import os
 import sys
 import time
 
-from azure.batch import BatchClient, models
-from azure.core.credentials import AzureNamedKeyCredential
-from azure.core.exceptions import ResourceNotFoundError
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.hybridcompute import HybridComputeManagementClient
+from azure.mgmt.hybridcompute.models import MachineRunCommand, MachineRunCommandScriptSource
 
-BATCH_ACCOUNT_NAME = os.environ["BATCH_ACCOUNT_NAME"]
-BATCH_ACCOUNT_URL = os.environ["BATCH_ACCOUNT_URL"]
-BATCH_ACCOUNT_KEY = os.environ["BATCH_ACCOUNT_KEY"]
-
-POOL_ID = "hybrid-pool"
-JOB_ID = f"hybrid-job-{datetime.datetime.now(datetime.UTC).strftime('%Y%m%d-%H%M%S')}"
-TASK_COUNT = 10
-
-
-def get_client() -> BatchClient:
-    credential = AzureNamedKeyCredential(BATCH_ACCOUNT_NAME, BATCH_ACCOUNT_KEY)
-    return BatchClient(endpoint=f"https://{BATCH_ACCOUNT_URL}", credential=credential)
+SUBSCRIPTION_ID = os.environ["AZURE_SUBSCRIPTION_ID"]
+RESOURCE_GROUP = os.environ.get("ARC_RESOURCE_GROUP", "hybrid-arc-rg")
+SCRIPT = os.environ.get(
+    "ARC_SCRIPT",
+    'echo "Processing on $(hostname) at $(date)"; sleep 3; echo "Done"',
+)
 
 
-def ensure_pool(client: BatchClient) -> None:
-    """Create the hybrid pool if it doesn't already exist."""
-    try:
-        client.get_pool(POOL_ID)
-        print(f"Pool '{POOL_ID}' already exists.")
-        return
-    except ResourceNotFoundError:
-        pass
-
-    pool = models.BatchPoolCreateOptions(
-        id=POOL_ID,
-        display_name="Hybrid compute pool",
-        vm_size="Standard_D2s_v3",
-        virtual_machine_configuration=models.VirtualMachineConfiguration(
-            image_reference=models.BatchVmImageReference(
-                publisher="canonical",
-                offer="0001-com-ubuntu-server-jammy",
-                sku="22_04-lts",
-                version="latest",
-            ),
-            node_agent_sku_id="batch.node.ubuntu 22.04",
-        ),
-        target_dedicated_nodes=0,
-        target_low_priority_nodes=0,
-    )
-    client.create_pool(pool=pool)
-    print(f"Pool '{POOL_ID}' created (cloud nodes: 0, waiting for on-prem nodes to join).")
+def get_client() -> HybridComputeManagementClient:
+    return HybridComputeManagementClient(DefaultAzureCredential(), SUBSCRIPTION_ID)
 
 
-def submit_job(client: BatchClient) -> None:
-    """Submit a job with sample tasks."""
-    job = models.BatchJobCreateOptions(
-        id=JOB_ID,
-        pool_info=models.BatchPoolInfo(pool_id=POOL_ID),
-    )
-    client.create_job(job=job)
-    print(f"Job '{JOB_ID}' created.")
-
-    tasks = [
-        models.BatchTaskCreateOptions(
-            id=f"task-{i:03d}",
-            command_line=f'/bin/bash -c "echo Processing item {i} on $(hostname); sleep 5; echo Done {i}"',
-        )
-        for i in range(TASK_COUNT)
-    ]
-    client.create_tasks(job_id=JOB_ID, task_collection=tasks)
-    print(f"Submitted {TASK_COUNT} tasks.")
-
-
-def wait_for_tasks(client: BatchClient) -> None:
-    """Poll until all tasks complete."""
-    print("Waiting for tasks to complete...")
-    while True:
-        tasks = list(client.list_tasks(job_id=JOB_ID))
-        completed = sum(1 for t in tasks if t.state == "completed")
-        print(f"  {completed}/{len(tasks)} completed", end="\r")
-        if completed == len(tasks):
-            break
-        time.sleep(5)
-
-    print(f"\nAll {len(tasks)} tasks completed.")
-    failed = [t for t in tasks if t.execution_info and t.execution_info.exit_code != 0]
-    if failed:
-        print(f"  ⚠ {len(failed)} task(s) failed.", file=sys.stderr)
+def list_arc_machines(client: HybridComputeManagementClient) -> list[str]:
+    machines = list(client.machines.list_by_resource_group(RESOURCE_GROUP))
+    connected = [m.name for m in machines if m.status == "Connected"]
+    print(f"Found {len(connected)} connected Arc machine(s): {connected}")
+    if not connected:
+        print("No connected Arc machines found. Register nodes first with setup_node.sh")
         sys.exit(1)
+    return connected
+
+
+def submit_run_command(
+    client: HybridComputeManagementClient,
+    machine_name: str,
+    cmd_name: str,
+) -> None:
+    location = client.machines.get(RESOURCE_GROUP, machine_name).location
+    cmd = MachineRunCommand(
+        location=location,
+        source=MachineRunCommandScriptSource(script=SCRIPT),
+        async_execution=False,
+    )
+    client.machine_run_commands.begin_create_or_update(
+        resource_group_name=RESOURCE_GROUP,
+        machine_name=machine_name,
+        run_command_name=cmd_name,
+        run_command_body=cmd,
+    ).result()
+
+
+def poll_run_command(
+    client: HybridComputeManagementClient,
+    machine_name: str,
+    cmd_name: str,
+    timeout_seconds: int = 300,
+) -> int:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        rc = client.machine_run_commands.get(RESOURCE_GROUP, machine_name, cmd_name)
+        state = rc.provisioning_state
+        if state in ("Succeeded", "Failed", "Canceled"):
+            iv = rc.instance_view
+            if iv:
+                if iv.output:
+                    print(f"  [stdout] {iv.output.strip()}")
+                if iv.error:
+                    print(f"  [stderr] {iv.error.strip()}", file=sys.stderr)
+                return iv.exit_code or 0
+            return 0
+        print(f"  [{machine_name}] state={state}, waiting...")
+        time.sleep(10)
+    raise TimeoutError(f"Run command on {machine_name} did not finish within {timeout_seconds}s")
 
 
 def main() -> None:
     client = get_client()
-    ensure_pool(client)
-    submit_job(client)
-    wait_for_tasks(client)
+    machines = list_arc_machines(client)
+
+    run_id = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d-%H%M%S")
+    cmd_names = {m: f"job-{run_id}-{m}" for m in machines}
+
+    for machine_name, cmd_name in cmd_names.items():
+        print(f"Submitting Run Command to {machine_name}...")
+        submit_run_command(client, machine_name, cmd_name)
+
+    exit_codes: dict[str, int] = {}
+    for machine_name, cmd_name in cmd_names.items():
+        print(f"Polling {machine_name}...")
+        exit_codes[machine_name] = poll_run_command(client, machine_name, cmd_name)
+
+    print("\nResults:")
+    failed = []
+    for machine_name, code in exit_codes.items():
+        status = "OK" if code == 0 else f"FAILED (exit {code})"
+        print(f"  {machine_name}: {status}")
+        if code != 0:
+            failed.append(machine_name)
+
+    if failed:
+        print(f"\n{len(failed)} machine(s) failed.", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

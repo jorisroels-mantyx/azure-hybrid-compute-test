@@ -6,4 +6,5 @@ dependencies = [
     "azure-mgmt-hybridcompute>=9.0.0",
     "azure-identity>=1.17.0",
     "azure-storage-blob>=12.20.0",
+    "pyyaml>=6.0",
 ]

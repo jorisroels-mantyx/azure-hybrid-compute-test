@@ -1,8 +1,6 @@
 """Submit container jobs to Arc-enabled on-prem servers via Azure Arc Run Command.
 
-Each task in the job spec runs `docker run <image>` on an Arc-connected machine.
-Env vars are baked into the container image; the job spec selects the image and
-which nodes to target.
+Runs `docker run <image>` on all connected Arc machines in the resource group.
 
 Required env vars:
     AZURE_SUBSCRIPTION_ID
@@ -13,13 +11,11 @@ Optional env vars:
 import argparse
 import datetime
 import os
-import pathlib
 import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 
-import yaml
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.hybridcompute import HybridComputeManagementClient
 from azure.mgmt.hybridcompute.models import MachineRunCommand, MachineRunCommandScriptSource
@@ -39,33 +35,12 @@ class TaskState(str, Enum):
 
 
 @dataclass
-class EnvironmentSetting:
-    name: str
-    value: str
-
-
-@dataclass
 class TaskSpec:
     id: str
     display_name: str = ""
     image: str = ""
-    environment_settings: list[EnvironmentSetting] = field(default_factory=list)
     timeout_seconds: int = 300
     node: str = ""
-
-
-@dataclass
-class PoolConfig:
-    resource_group: str = ""
-    node_filter: list[str] = field(default_factory=list)
-
-
-@dataclass
-class JobSpec:
-    id: str
-    display_name: str = ""
-    pool: PoolConfig = field(default_factory=PoolConfig)
-    tasks: list[TaskSpec] = field(default_factory=list)
 
 
 @dataclass
@@ -84,49 +59,6 @@ class JobResult:
     job_id: str
     run_id: str
     task_results: list[TaskResult] = field(default_factory=list)
-
-
-# ── Job spec loading ──────────────────────────────────────────────────────────
-
-def load_job_spec(spec_path: pathlib.Path) -> JobSpec:
-    raw = yaml.safe_load(spec_path.read_text())
-    j = raw["job"]
-
-    pool_raw = j.get("pool", {})
-    pool = PoolConfig(
-        resource_group=pool_raw.get("resource_group", ""),
-        node_filter=pool_raw.get("node_filter") or [],
-    )
-
-    tasks: list[TaskSpec] = []
-    for t in j.get("tasks", []):
-        env = [
-            EnvironmentSetting(name=e["name"], value=str(e["value"]))
-            for e in t.get("environment_settings", [])
-        ]
-        tasks.append(TaskSpec(
-            id=t["id"],
-            display_name=t.get("display_name", ""),
-            image=t["image"],
-            environment_settings=env,
-            timeout_seconds=t.get("timeout_seconds", 300),
-            node=t.get("node", ""),
-        ))
-
-    return JobSpec(
-        id=j["id"],
-        display_name=j.get("display_name", ""),
-        pool=pool,
-        tasks=tasks,
-    )
-
-
-def quick_job_spec(image: str, job_id: str) -> JobSpec:
-    return JobSpec(
-        id=job_id,
-        display_name="Quick submit",
-        tasks=[TaskSpec(id="task-001", display_name="Quick task", image=image)],
-    )
 
 
 # ── Task distribution ─────────────────────────────────────────────────────────
@@ -168,12 +100,9 @@ def get_client() -> HybridComputeManagementClient:
     return HybridComputeManagementClient(DefaultAzureCredential(), SUBSCRIPTION_ID)
 
 
-def discover_pool(client: HybridComputeManagementClient, pool: PoolConfig) -> list[str]:
-    rg = pool.resource_group or DEFAULT_RESOURCE_GROUP
+def discover_pool(client: HybridComputeManagementClient, rg: str) -> list[str]:
     machines = list(client.machines.list_by_resource_group(rg))
     connected = [m.name for m in machines if m.status == "Connected"]
-    if pool.node_filter:
-        connected = [m for m in connected if m in pool.node_filter]
     if not connected:
         print("No connected Arc machines found.", file=sys.stderr)
         sys.exit(1)
@@ -195,11 +124,7 @@ def build_docker_script(task: TaskSpec) -> str:
                 "",
             ]
 
-    env_flags = "".join(
-        f"  -e {e.name}='{e.value.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}' \\\n"
-        for e in task.environment_settings
-    )
-    lines.append(f"docker run --rm \\\n{env_flags}  {task.image}")
+    lines.append(f"docker run --rm \\\n  {task.image}")
     return "\n".join(lines)
 
 
@@ -256,18 +181,20 @@ def poll_task(
 
 def run_job(
     client: HybridComputeManagementClient,
-    spec: JobSpec,
+    image: str,
+    job_id: str,
     wait: bool = True,
 ) -> JobResult:
-    rg = spec.pool.resource_group or DEFAULT_RESOURCE_GROUP
+    rg = DEFAULT_RESOURCE_GROUP
     run_id = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d-%H%M%S")
 
-    print(f"Job:    {spec.id}  ({spec.display_name})")
+    print(f"Job:    {job_id}")
     print(f"Run ID: {run_id}")
 
-    machines = discover_pool(client, spec.pool)
-    assignments = assign_tasks(spec.tasks, machines)
-    job_result = JobResult(job_id=spec.id, run_id=run_id)
+    machines = discover_pool(client, rg)
+    task = TaskSpec(id="task-001", display_name="", image=image)
+    assignments = assign_tasks([task], machines)
+    job_result = JobResult(job_id=job_id, run_id=run_id)
 
     # Build (cmd_name → TaskResult) index alongside assignments
     indexed: list[tuple[TaskSpec, str, str, TaskResult]] = []
@@ -333,18 +260,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Submit container jobs to Arc-enabled machines (Azure Batch-style UX)",
     )
     p.add_argument(
-        "spec",
-        nargs="?",
-        type=pathlib.Path,
-        metavar="JOB_SPEC",
-        help="Path to a job spec YAML file (e.g. job.yaml)",
-    )
-    p.add_argument(
         "--image",
         metavar="IMAGE",
-        help="Quick submit: container image to run on all connected nodes",
+        required=True,
+        help="Container image to run on all connected nodes",
     )
-    p.add_argument("--job-id", metavar="ID", help="Job ID (used in quick-submit mode)")
+    p.add_argument("--job-id", metavar="ID", help="Job ID (defaults to a timestamp)")
     wait_group = p.add_mutually_exclusive_group()
     wait_group.add_argument("--wait", action="store_true", default=True)
     wait_group.add_argument("--no-wait", dest="wait", action="store_false")
@@ -354,17 +275,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
-    if args.spec:
-        spec = load_job_spec(args.spec)
-    elif args.image:
-        run_ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d-%H%M%S")
-        spec = quick_job_spec(args.image, args.job_id or f"quick-{run_ts}")
-    else:
-        build_parser().print_help()
-        sys.exit(1)
+    run_ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d-%H%M%S")
+    job_id = args.job_id or f"job-{run_ts}"
 
     client = get_client()
-    result = run_job(client, spec, wait=args.wait)
+    result = run_job(client, args.image, job_id, wait=args.wait)
     print_summary(result)
 
     failed = [

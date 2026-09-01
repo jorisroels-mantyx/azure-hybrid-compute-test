@@ -7,7 +7,7 @@ which nodes to target.
 Required env vars:
     AZURE_SUBSCRIPTION_ID
 Optional env vars:
-    ARC_RESOURCE_GROUP  (default: hybrid-arc-rg)
+    AZURE_RESOURCE_GROUP  (default: hybrid-arc-rg)
 """
 
 import argparse
@@ -25,7 +25,7 @@ from azure.mgmt.hybridcompute import HybridComputeManagementClient
 from azure.mgmt.hybridcompute.models import MachineRunCommand, MachineRunCommandScriptSource
 
 SUBSCRIPTION_ID = os.environ["AZURE_SUBSCRIPTION_ID"]
-DEFAULT_RESOURCE_GROUP = os.environ.get("ARC_RESOURCE_GROUP", "hybrid-arc-rg")
+DEFAULT_RESOURCE_GROUP = os.environ.get("AZURE_RESOURCE_GROUP", "hybrid-arc-rg")
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -183,6 +183,18 @@ def discover_pool(client: HybridComputeManagementClient, pool: PoolConfig) -> li
 
 def build_docker_script(task: TaskSpec) -> str:
     lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
+
+    # Auto-login to ACR when the image is hosted there
+    if ".azurecr.io" in task.image:
+        registry = task.image.split("/")[0]
+        acr_user = os.environ.get("ACR_USERNAME", "")
+        acr_pass = os.environ.get("ACR_PASSWORD", "")
+        if acr_user and acr_pass:
+            lines += [
+                f"echo '{acr_pass}' | docker login {registry} -u '{acr_user}' --password-stdin",
+                "",
+            ]
+
     env_flags = "".join(
         f"  -e {e.name}='{e.value.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}' \\\n"
         for e in task.environment_settings
@@ -202,7 +214,7 @@ def submit_task(
     cmd = MachineRunCommand(
         location=location,
         source=MachineRunCommandScriptSource(script=build_docker_script(task)),
-        async_execution=True,
+        async_execution=False,
     )
     client.machine_run_commands.begin_create_or_update(
         resource_group_name=rg,
@@ -301,7 +313,7 @@ def print_summary(result: JobResult) -> None:
     print(sep)
     for tr in result.task_results:
         exit_str = str(tr.exit_code) if tr.exit_code is not None else "—"
-        print(f"{tr.task_id:<30}  {tr.machine_name:<20}  {tr.state:<10}  {exit_str:>4}")
+        print(f"{tr.task_id:<30}  {tr.machine_name:<20}  {tr.state.value:<10}  {exit_str:>4}")
     print(sep)
 
     for tr in result.task_results:

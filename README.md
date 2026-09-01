@@ -85,11 +85,26 @@ az acr build \
 
 ### 5. Submit a job
 
-Quick submit — runs the image on all connected nodes:
-
 ```bash
 uv run submit_job.py --image "$AZURE_ACR_NAME.azurecr.io/train-iris:latest"
 ```
+
+By default the job runs on the first connected node. Use `--machine` to target a specific one:
+
+```bash
+uv run submit_job.py --image "$AZURE_ACR_NAME.azurecr.io/train-iris:latest" --machine gpu1
+```
+
+If the named machine is not found or not connected, the job falls back to the first available node with a warning.
+
+Additional options:
+
+| Flag | Description |
+|---|---|
+| `--image IMAGE` | Container image to run (required) |
+| `--machine NAME` | Target machine name (optional, falls back to first available) |
+| `--job-id ID` | Job ID used in the run command name (defaults to a timestamp) |
+| `--no-wait` | Submit without waiting for the job to complete |
 
 ## Project structure
 

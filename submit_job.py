@@ -51,14 +51,17 @@ def get_client() -> HybridComputeManagementClient:
     return HybridComputeManagementClient(DefaultAzureCredential(), SUBSCRIPTION_ID)
 
 
-def discover_machine(client: HybridComputeManagementClient, rg: str) -> str:
+def discover_machine(client: HybridComputeManagementClient, rg: str, name: str | None = None) -> str:
     machines = list(client.machines.list_by_resource_group(rg))
     connected = [m.name for m in machines if m.status == "Connected"]
     if not connected:
         print("No connected Arc machines found.", file=sys.stderr)
         sys.exit(1)
-    if len(connected) > 1:
-        print(f"Warning: multiple connected machines {connected}, using {connected[0]}", file=sys.stderr)
+    if name:
+        if name in connected:
+            print(f"Machine: {name}")
+            return name
+        print(f"Warning: machine '{name}' not found or not connected, falling back to {connected[0]}", file=sys.stderr)
     print(f"Machine: {connected[0]}")
     return connected[0]
 
@@ -136,16 +139,17 @@ def run_job(
     client: HybridComputeManagementClient,
     image: str,
     job_id: str,
+    machine_name: str | None = None,
     wait: bool = True,
 ) -> JobResult:
     rg = DEFAULT_RESOURCE_GROUP
     run_id = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d-%H%M%S")
-    cmd_name = f"arc-{run_id}-{job_id}"[:64]
+    cmd_name = f"arc-{run_id}"
 
     print(f"Job:    {job_id}")
     print(f"Run ID: {run_id}")
 
-    machine = discover_machine(client, rg)
+    machine = discover_machine(client, rg, machine_name)
     result = JobResult(job_id=job_id, run_id=run_id, machine=machine)
 
     print(f"  Submitting → {machine} ...")
@@ -191,6 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run a container image on an Arc-connected machine",
     )
     p.add_argument("--image", metavar="IMAGE", required=True, help="Container image to run")
+    p.add_argument("--machine", metavar="NAME", help="Target machine name (falls back to first available)")
     p.add_argument("--job-id", metavar="ID", help="Job ID (defaults to a timestamp)")
     wait_group = p.add_mutually_exclusive_group()
     wait_group.add_argument("--wait", action="store_true", default=True)
@@ -205,7 +210,7 @@ def main() -> None:
     job_id = args.job_id or f"job-{run_ts}"
 
     client = get_client()
-    result = run_job(client, args.image, job_id, wait=args.wait)
+    result = run_job(client, args.image, job_id, machine_name=args.machine, wait=args.wait)
     print_summary(result)
 
     if result.state in (JobState.FAILED, JobState.TIMED_OUT):

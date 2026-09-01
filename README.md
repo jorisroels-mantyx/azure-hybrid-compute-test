@@ -48,7 +48,7 @@ Copy `.env.example` to `.env` and fill in your values.
 ```bash
 cp .env.example .env
 # edit .env with your values
-source .env
+set -a && source .env && set +a
 ```
 
 ### 2. Deploy Azure infrastructure and configure access
@@ -64,7 +64,7 @@ This deploys the resource group, ACR, and Log Analytics workspace; and creates a
 On each on-prem server (re-source `.env` first so the new SP credentials are in scope):
 
 ```bash
-source .env
+set -a && source .env && set +a
 bash infra/setup_node.sh
 ```
 

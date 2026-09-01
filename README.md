@@ -71,7 +71,7 @@ bash infra/setup_node.sh
 Verify registration (from your local machine, after ~2 minutes):
 
 ```bash
-az connectedmachine list --resource-group "$AZURE_RESOURCE_GROUP" -o table
+uv run list_machines.py
 ```
 
 ### 4. Build and push the container image
@@ -118,7 +118,8 @@ infra/
 container/
   Dockerfile        # Container image definition
   train.py          # Training script (scikit-learn iris example)
-submit_job.py       # Dispatches Arc Run Commands to registered nodes
+list_machines.py    # Lists Arc-connected machines and their status
+submit_job.py       # Dispatches an Arc Run Command to a registered node
 .env.example        # Environment variable template
 pyproject.toml      # Python dependencies
 ```

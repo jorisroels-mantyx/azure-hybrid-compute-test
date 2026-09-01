@@ -1,6 +1,6 @@
-"""Submit container jobs to Arc-enabled on-prem servers via Azure Arc Run Command.
+"""Submit a container job to Arc-enabled on-prem servers via Azure Arc Run Command.
 
-Runs `docker run <image>` on all connected Arc machines in the resource group.
+Runs `docker run <image>` on the single connected Arc machine in the resource group.
 
 Required env vars:
     AZURE_SUBSCRIPTION_ID
@@ -13,7 +13,7 @@ import datetime
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 from azure.identity import DefaultAzureCredential
@@ -26,7 +26,7 @@ DEFAULT_RESOURCE_GROUP = os.environ.get("AZURE_RESOURCE_GROUP", "hybrid-arc-rg")
 
 # ── Data model ────────────────────────────────────────────────────────────────
 
-class TaskState(str, Enum):
+class JobState(str, Enum):
     ACTIVE    = "active"
     RUNNING   = "running"
     COMPLETED = "completed"
@@ -35,63 +35,14 @@ class TaskState(str, Enum):
 
 
 @dataclass
-class TaskSpec:
-    id: str
-    display_name: str = ""
-    image: str = ""
-    timeout_seconds: int = 300
-    node: str = ""
-
-
-@dataclass
-class TaskResult:
-    task_id: str
-    machine_name: str
-    cmd_name: str
-    state: TaskState = TaskState.ACTIVE
-    exit_code: int | None = None
-    stdout: str = ""
-    stderr: str = ""
-
-
-@dataclass
 class JobResult:
     job_id: str
     run_id: str
-    task_results: list[TaskResult] = field(default_factory=list)
-
-
-# ── Task distribution ─────────────────────────────────────────────────────────
-
-def assign_tasks(
-    tasks: list[TaskSpec],
-    machines: list[str],
-) -> list[tuple[TaskSpec, str]]:
-    from dataclasses import replace
-
-    assignments: list[tuple[TaskSpec, str]] = []
-    pinned = [t for t in tasks if t.node]
-    unpinned = [t for t in tasks if not t.node]
-
-    for task in pinned:
-        if task.node not in machines:
-            print(
-                f"Error: task '{task.id}' pinned to '{task.node}' but that node "
-                f"is not connected. Connected: {machines}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        assignments.append((task, task.node))
-
-    if len(unpinned) == 1:
-        for machine in machines:
-            derived = replace(unpinned[0], id=f"{unpinned[0].id}-{machine}")
-            assignments.append((derived, machine))
-    else:
-        for i, task in enumerate(unpinned):
-            assignments.append((task, machines[i % len(machines)]))
-
-    return assignments
+    machine: str
+    state: JobState = JobState.ACTIVE
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
 
 
 # ── Arc helpers ───────────────────────────────────────────────────────────────
@@ -100,22 +51,24 @@ def get_client() -> HybridComputeManagementClient:
     return HybridComputeManagementClient(DefaultAzureCredential(), SUBSCRIPTION_ID)
 
 
-def discover_pool(client: HybridComputeManagementClient, rg: str) -> list[str]:
+def discover_machine(client: HybridComputeManagementClient, rg: str) -> str:
     machines = list(client.machines.list_by_resource_group(rg))
     connected = [m.name for m in machines if m.status == "Connected"]
     if not connected:
         print("No connected Arc machines found.", file=sys.stderr)
         sys.exit(1)
-    print(f"Pool: {len(connected)} node(s) — {connected}")
-    return connected
+    if len(connected) > 1:
+        print(f"Warning: multiple connected machines {connected}, using {connected[0]}", file=sys.stderr)
+    print(f"Machine: {connected[0]}")
+    return connected[0]
 
 
-def build_docker_script(task: TaskSpec) -> str:
+def build_docker_script(image: str) -> str:
     lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
 
     # Auto-login to ACR when the image is hosted there
-    if ".azurecr.io" in task.image:
-        registry = task.image.split("/")[0]
+    if ".azurecr.io" in image:
+        registry = image.split("/")[0]
         acr_user = os.environ.get("ACR_USERNAME", "")
         acr_pass = os.environ.get("ACR_PASSWORD", "")
         if acr_user and acr_pass:
@@ -124,21 +77,21 @@ def build_docker_script(task: TaskSpec) -> str:
                 "",
             ]
 
-    lines.append(f"docker run --rm \\\n  {task.image}")
+    lines.append(f"docker run --rm {image}")
     return "\n".join(lines)
 
 
-def submit_task(
+def submit_run_command(
     client: HybridComputeManagementClient,
     rg: str,
     machine: str,
     cmd_name: str,
-    task: TaskSpec,
+    image: str,
 ) -> None:
     location = client.machines.get(rg, machine).location
     cmd = MachineRunCommand(
         location=location,
-        source=MachineRunCommandScriptSource(script=build_docker_script(task)),
+        source=MachineRunCommandScriptSource(script=build_docker_script(image)),
         async_execution=False,
     )
     client.machine_run_commands.begin_create_or_update(
@@ -149,15 +102,15 @@ def submit_task(
     ).result()
 
 
-def poll_task(
+def poll_run_command(
     client: HybridComputeManagementClient,
     rg: str,
     machine: str,
     cmd_name: str,
-    result: TaskResult,
-    timeout_seconds: int,
+    result: JobResult,
+    timeout_seconds: int = 300,
 ) -> None:
-    result.state = TaskState.RUNNING
+    result.state = JobState.RUNNING
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         rc = client.machine_run_commands.get(rg, machine, cmd_name)
@@ -168,12 +121,12 @@ def poll_task(
             result.stderr = (iv.error or "").strip() if iv else ""
             result.exit_code = (iv.exit_code or 0) if iv else 0
             result.state = (
-                TaskState.COMPLETED if result.exit_code == 0 else TaskState.FAILED
+                JobState.COMPLETED if result.exit_code == 0 else JobState.FAILED
             )
             return
-        print(f"  [{result.task_id} @ {machine}] {state}, waiting...")
+        print(f"  [{machine}] {state}, waiting...")
         time.sleep(10)
-    result.state = TaskState.TIMED_OUT
+    result.state = JobState.TIMED_OUT
     result.exit_code = -1
 
 
@@ -187,46 +140,32 @@ def run_job(
 ) -> JobResult:
     rg = DEFAULT_RESOURCE_GROUP
     run_id = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d-%H%M%S")
+    cmd_name = f"arc-{run_id}-{job_id}"[:64]
 
     print(f"Job:    {job_id}")
     print(f"Run ID: {run_id}")
 
-    machines = discover_pool(client, rg)
-    task = TaskSpec(id="task-001", display_name="", image=image)
-    assignments = assign_tasks([task], machines)
-    job_result = JobResult(job_id=job_id, run_id=run_id)
+    machine = discover_machine(client, rg)
+    result = JobResult(job_id=job_id, run_id=run_id, machine=machine)
 
-    # Build (cmd_name → TaskResult) index alongside assignments
-    indexed: list[tuple[TaskSpec, str, str, TaskResult]] = []
-    for task, machine in assignments:
-        cmd_name = f"arc-{run_id}-{task.id}"[:64]
-        tr = TaskResult(task_id=task.id, machine_name=machine, cmd_name=cmd_name)
-        job_result.task_results.append(tr)
-        indexed.append((task, machine, cmd_name, tr))
+    print(f"  Submitting → {machine} ...")
+    try:
+        submit_run_command(client, rg, machine, cmd_name, image)
+        result.state = JobState.RUNNING
+    except Exception as exc:
+        result.state = JobState.FAILED
+        result.stderr = str(exc)
+        print(f"  Submission failed: {exc}", file=sys.stderr)
+        return result
 
-    for task, machine, cmd_name, tr in indexed:
-        print(f"  Submitting '{task.id}' → {machine} ...")
+    if wait:
         try:
-            submit_task(client, rg, machine, cmd_name, task)
-            tr.state = TaskState.RUNNING
+            poll_run_command(client, rg, machine, cmd_name, result)
         except Exception as exc:
-            tr.state = TaskState.FAILED
-            tr.stderr = str(exc)
-            print(f"  Submission failed: {exc}", file=sys.stderr)
+            result.state = JobState.FAILED
+            result.stderr = str(exc)
 
-    if not wait:
-        return job_result
-
-    for task, machine, cmd_name, tr in indexed:
-        if tr.state == TaskState.FAILED:
-            continue
-        try:
-            poll_task(client, rg, machine, cmd_name, tr, task.timeout_seconds)
-        except Exception as exc:
-            tr.state = TaskState.FAILED
-            tr.stderr = str(exc)
-
-    return job_result
+    return result
 
 
 # ── Output ────────────────────────────────────────────────────────────────────
@@ -234,22 +173,14 @@ def run_job(
 def print_summary(result: JobResult) -> None:
     sep = "─" * 72
     print(f"\n{sep}")
-    print(f"Job: {result.job_id}   Run: {result.run_id}")
+    print(f"Job: {result.job_id}   Run: {result.run_id}   Node: {result.machine}")
+    exit_str = str(result.exit_code) if result.exit_code is not None else "—"
+    print(f"State: {result.state.value}   Exit: {exit_str}")
     print(sep)
-    print(f"{'TASK ID':<30}  {'NODE':<20}  {'STATE':<10}  {'EXIT':>4}")
-    print(sep)
-    for tr in result.task_results:
-        exit_str = str(tr.exit_code) if tr.exit_code is not None else "—"
-        print(f"{tr.task_id:<30}  {tr.machine_name:<20}  {tr.state.value:<10}  {exit_str:>4}")
-    print(sep)
-
-    for tr in result.task_results:
-        if tr.stdout or tr.stderr:
-            print(f"\n[{tr.task_id} @ {tr.machine_name}]")
-            if tr.stdout:
-                print(f"  stdout:\n{tr.stdout}")
-            if tr.stderr:
-                print(f"  stderr:\n{tr.stderr}", file=sys.stderr)
+    if result.stdout:
+        print(f"stdout:\n{result.stdout}")
+    if result.stderr:
+        print(f"stderr:\n{result.stderr}", file=sys.stderr)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -257,14 +188,9 @@ def print_summary(result: JobResult) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="submit_job.py",
-        description="Submit container jobs to Arc-enabled machines (Azure Batch-style UX)",
+        description="Run a container image on an Arc-connected machine",
     )
-    p.add_argument(
-        "--image",
-        metavar="IMAGE",
-        required=True,
-        help="Container image to run on all connected nodes",
-    )
+    p.add_argument("--image", metavar="IMAGE", required=True, help="Container image to run")
     p.add_argument("--job-id", metavar="ID", help="Job ID (defaults to a timestamp)")
     wait_group = p.add_mutually_exclusive_group()
     wait_group.add_argument("--wait", action="store_true", default=True)
@@ -282,12 +208,7 @@ def main() -> None:
     result = run_job(client, args.image, job_id, wait=args.wait)
     print_summary(result)
 
-    failed = [
-        tr for tr in result.task_results
-        if tr.state in (TaskState.FAILED, TaskState.TIMED_OUT)
-    ]
-    if failed:
-        print(f"\n{len(failed)} task(s) failed.", file=sys.stderr)
+    if result.state in (JobState.FAILED, JobState.TIMED_OUT):
         sys.exit(1)
 
 

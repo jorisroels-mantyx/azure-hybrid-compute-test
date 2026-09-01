@@ -1,6 +1,8 @@
 FROM python:3.12-slim
 WORKDIR /app
-RUN pip install --no-cache-dir scikit-learn
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY pyproject.toml .
+RUN uv sync --no-cache
 COPY train.py .
 ENV N_ESTIMATORS=100
-CMD ["python", "train.py"]
+CMD ["uv", "run", "python", "train.py"]

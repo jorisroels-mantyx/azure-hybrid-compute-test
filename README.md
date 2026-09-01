@@ -31,7 +31,7 @@ Each on-prem server runs the Azure Arc Connected Machine Agent (`azcmagent`), wh
 | `AZURE_SUBSCRIPTION_ID` | all | Azure subscription ID |
 | `AZURE_LOCATION` | infra, setup_node.sh | Azure region (e.g. `swedencentral`) |
 | `AZURE_RESOURCE_GROUP` | all | Resource group for Arc and ACR resources |
-| `AZURE_ACR_NAME` | infra, submit_job.py | Azure Container Registry name |
+| `AZURE_ACR_NAME` | infra, setup_node.sh, submit_job.py | Azure Container Registry name |
 | `AZURE_TENANT_ID` | setup_node.sh | AAD tenant ID |
 | `AZURE_SERVICE_PRINCIPAL_ID` | setup_node.sh | Service principal app ID for Arc onboarding |
 | `AZURE_SERVICE_PRINCIPAL_SECRET` | setup_node.sh | Service principal secret |
@@ -51,42 +51,21 @@ cp .env.example .env
 source .env
 ```
 
-### 2. Deploy Azure infrastructure
+### 2. Deploy Azure infrastructure and configure access
 
 ```bash
-az deployment sub create \
-  --subscription "$AZURE_SUBSCRIPTION_ID" \
-  --location "$AZURE_LOCATION" \
-  --template-file main.bicep \
-  --parameters main.bicepparam \
-  --parameters location="$AZURE_LOCATION" resourceGroupName="$AZURE_RESOURCE_GROUP" acrName="$AZURE_ACR_NAME"
+bash infra/setup_infra.sh
 ```
 
-This creates the resource group, ACR, and Log Analytics workspace.
+This deploys the resource group, ACR, and Log Analytics workspace; and creates a service principal for Arc node onboarding, writing its credentials back to `.env`.
 
 ### 3. Register on-prem nodes
 
-Create a service principal with the `Azure Connected Machine Onboarding` role:
+On each on-prem server (re-source `.env` first so the new SP credentials are in scope):
 
 ```bash
-az ad sp create-for-rbac \
-  --name "arc-onboarding-sp" \
-  --role "Azure Connected Machine Onboarding" \
-  --scopes "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$AZURE_RESOURCE_GROUP"
-```
-
-Copy the output values into `.env` and export them:
-
-```bash
-export AZURE_TENANT_ID=<tenant>
-export AZURE_SERVICE_PRINCIPAL_ID=<appId>
-export AZURE_SERVICE_PRINCIPAL_SECRET=<password>
-```
-
-Then on each on-prem server:
-
-```bash
-bash setup_node.sh
+source .env
+bash infra/setup_node.sh
 ```
 
 Verify registration (from your local machine, after ~2 minutes):
@@ -104,21 +83,7 @@ az acr build \
   ./container
 ```
 
-### 5. Grant the Arc node's identity pull access to ACR
-
-```bash
-PRINCIPAL=$(az connectedmachine show \
-  --name "$AZURE_ARC_MACHINE_NAME" \
-  --resource-group "$AZURE_RESOURCE_GROUP" \
-  --query identity.principalId -o tsv)
-
-az role assignment create \
-  --assignee "$PRINCIPAL" \
-  --role AcrPull \
-  --scope "$(az acr show --name "$AZURE_ACR_NAME" --query id -o tsv)"
-```
-
-### 6. Submit a job
+### 5. Submit a job
 
 Quick submit — runs the image on all connected nodes:
 
@@ -126,24 +91,19 @@ Quick submit — runs the image on all connected nodes:
 uv run submit_job.py --image "$AZURE_ACR_NAME.azurecr.io/train-iris:latest"
 ```
 
-Or from a job spec YAML:
-
-```bash
-uv run submit_job.py job.yaml
-```
-
 ## Project structure
 
 ```
-main.bicep          # Subscription-scoped entry point
-resources.bicep     # Azure resource definitions
-main.bicepparam     # Deployment parameters
+infra/
+  main.bicep        # Subscription-scoped entry point
+  resources.bicep   # Azure resource definitions
+  main.bicepparam   # Deployment parameters
+  setup_infra.sh    # Deploys infrastructure and creates the Arc onboarding service principal
+  setup_node.sh     # Installs the Arc agent, connects the node, and grants it AcrPull
 container/
   Dockerfile        # Container image definition
   train.py          # Training script (scikit-learn iris example)
 submit_job.py       # Dispatches Arc Run Commands to registered nodes
-setup_node.sh       # Installs and connects the Arc agent on on-prem servers
-job.yaml            # Example job spec
 .env.example        # Environment variable template
 pyproject.toml      # Python dependencies
 ```
